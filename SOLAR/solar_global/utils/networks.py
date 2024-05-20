@@ -4,12 +4,12 @@ import torch
 from solar_global.utils.general import get_data_root
 from solar_global.networks.imageretrievalnet import init_network
 
-def load_network(network_name='resnet101-solar-best.pth', device = 'cpu'):
+def load_network(network_path='resnet101-solar-best.pth', device = 'cpu'):
     # loading network
     # pretrained networks (downloaded automatically)
-    print(">> Loading network:\n>>>> '{}'".format(network_name))
+    print(">> Loading network:\n>>>> '{}'".format(network_path))
     # state = torch.load(os.path.join(get_data_root(), 'networks', network_name))
-    state = torch.load(os.path.join(get_data_root(), 'networks', network_name), map_location=torch.device(device))
+    state = torch.load(network_path, map_location=torch.device(device))
 
     # parsing net params from meta
     # architecture, pooling, mean, std required

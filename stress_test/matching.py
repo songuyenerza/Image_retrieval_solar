@@ -7,7 +7,7 @@ import numpy as np
 from tqdm import tqdm
 import lmdb
 import time
-
+import faiss
 
 sys.path.append("./SOLAR")
 
@@ -20,33 +20,28 @@ def color_norm(im, mean, std):
         im[i] = im[i] / std[i]
     return im
 
-def prepare_im( im):
-        _MEAN = [0.485, 0.456, 0.406]
-        _SD = [0.229, 0.224, 0.225]
-        """Prepares the image for network input."""
-        im = im.transpose([2, 0, 1])
-        # [0, 255] -> [0, 1]
-        im = im / 255.0
-        # Color normalization
-        im = color_norm(im, _MEAN, _SD)
-        # im = trans(im)
-        im = torch.from_numpy(im)
-        im = im.unsqueeze(0)
-        return im
+def prepare_im(im):
+    _MEAN = [0.485, 0.456, 0.406]
+    _SD = [0.229, 0.224, 0.225]
+    """Prepares the image for network input."""
+    im = im.transpose([2, 0, 1])
+    # [0, 255] -> [0, 1]
+    im = im / 255.0
+    # Color normalization
+    im = color_norm(im, _MEAN, _SD)
+    im = torch.from_numpy(im)
+    im = im.unsqueeze(0)
+    return im
 
 def extract_feat(net, image):
-    _scale_list = [0.7071, 1, 1.4142]
+    # _scale_list = [0.7071, 1, 1.4142]
+    _scale_list = [1]
+
+
     img_ = image
-        # Ensure the image is a numpy array
-    # if not isinstance(image, np.ndarray):
-    #     raise ValueError("Image must be a numpy array")
     img_query = cv2.cvtColor(img_, cv2.COLOR_BGR2RGB)
     im = img_query
-    # im = np.stack((im,)*3, axis=-1)   
-    im_ = cv2.resize(im, (256, int(im.shape[0]*256/im.shape[1])))
-    # im = cv2.resize(im, (512,512))
-    # center = im_.shape
-
+    im_ = cv2.resize(im, (256, int(im.shape[0] * 256 / im.shape[1])))
     im = im_.astype(np.float32, copy=False)
     im = prepare_im(im)
 
@@ -64,10 +59,9 @@ def extract_feat(net, image):
     return v.numpy().astype(np.float16)
 
 class search_solar():
-    def __init__(self, network_name = 'resnet101-solar-best.pth', device = 'cpu', lmdb_path = ''):
-        net = load_network(network_name=network_name, device = device)
+    def __init__(self, network_path='resnet101-solar-best.pth', device='cuda', lmdb_path=''):
         self.device = device
-        # net.cuda()
+        net = load_network(network_path=network_path, device=device)
         net.eval()
         print(net.meta_repr())
         self.model = net
@@ -76,11 +70,14 @@ class search_solar():
             self.features_DB, self.ids_list = self.load_features_from_lmdb(lmdb_path)
             print("self.features_DB: ", self.features_DB.shape)
             print("self.ids_list: ", self.ids_list)
+            self.features_DB = self.features_DB.cpu().numpy()
+            self.features_DB_tensor = torch.tensor(self.features_DB, device=self.device)
+            self.features_DB_tensor /= self.features_DB_tensor.norm(dim=-1, keepdim=True)
 
-    
+
     def gen_db(self, folder_data, lmdb_path):
-        os.makedirs(lmdb_path, exist_ok= True)
-        env = lmdb.open(lmdb_path, map_size=1e12)  # Set a large map_size, depending on your data
+        os.makedirs(lmdb_path, exist_ok=True)
+        env = lmdb.open(lmdb_path, map_size=1e12)
 
         with env.begin(write=True) as txn:
             for path in tqdm(os.listdir(folder_data)):
@@ -89,8 +86,7 @@ class search_solar():
                 image = cv2.imread(img_path)
                 feat_q = extract_feat(self.model, image)
                 print("Saving feature with shape:", feat_q.shape, "and dtype:", feat_q.dtype)
-
-                txn.put(f"{name}".encode(), feat_q.tobytes())
+                txn.put(name.encode(), feat_q.tobytes())
 
         env.close()
         return lmdb_path
@@ -99,51 +95,47 @@ class search_solar():
         env = lmdb.open(lmdb_path, readonly=True)
         features_list = []
         ids_list = []
-        try:
-            with env.begin() as txn:
-                cursor = txn.cursor()
-                for key, value in cursor:
-                    key_id = key.decode()
-                    feature_array = np.frombuffer(value, dtype=np.float16).reshape(-1)
-                    ids_list.append(key_id)
-                    features_list.append(feature_array)
-        finally:
-            env.close()
+
+        with env.begin() as txn:
+            cursor = txn.cursor()
+            for key, value in cursor:
+                ids_list.append(key.decode())
+                features_list.append(np.frombuffer(value, dtype=np.float16))
         
         features_array = np.stack(features_list)
-        features_tensor = torch.tensor(features_array, dtype=torch.float32).to(self.device)
+        features_tensor = torch.tensor(features_array, dtype=torch.float16).to(self.device)
+        
         return features_tensor, ids_list
 
-    def search_image(self, image, top_k=10):
+    def search_image(self, image, top_k=5):
         t0 = time.time()
         feat_q = extract_feat(self.model, image)
-        feat_q = torch.tensor(feat_q, dtype=torch.float32).to(self.device)
-        similarity = (100 * feat_q @ self.features_DB.T).softmax(dim=-1)
-        print("similarity: ", similarity.numel())
+        feat_q = torch.tensor(feat_q, device=self.device, dtype=torch.float16).unsqueeze(0)
 
-        values, indices = similarity[0].topk(top_k)
-        print("values, indices ", values, indices )
-        print("\nTop predictions:\n")
-        for value, index in zip(values, indices):
+        # Normalize features
+        feat_q /= feat_q.norm(dim=-1, keepdim=True)
 
-            print(f"{self.ids_list[index]}: {100 * value.item():.2f}%")
+        # Compute similarity
+        similarity = (feat_q @ self.features_DB_tensor.T).squeeze(0).cpu().numpy()
 
-        print("Time per image: ", time.time() - t0)
-        return 0
+        # Filter and sort by similarity score
+        top_indices = np.argsort(similarity)[-top_k:][::-1]
+        results = [(self.ids_list[idx], similarity[idx]) for idx in top_indices]
 
+        print("Search results:", results)
+        print("Time per image:", time.time() - t0)
+        return results
 
 
 if __name__ == '__main__':
+    solar_search = search_solar(network_path='./SOLAR/data/networks/resnet101-solar-best.pth', device='cuda', lmdb_path='./data/20240520_feature_DB')
 
-    solar_search = search_solar( network_name = 'resnet101-solar-best.pth', device = 'cpu', lmdb_path = './stress_test/20240520_feature_DB')
+    # Uncomment to generate the database
+    # solar_search.gen_db(folder_data="./data/20240520_Data_product", lmdb_path="./data/20240520_feature_DB")
 
-    # solar_search.gen_db(folder_data ="/home/sonlt373/Desktop/SoNg/FF_project/data/20240520_Data_product",
-    #                     lmdb_path = "./stress_test/20240520_feature_DB")
-
-    folder_check = "/home/sonlt373/Desktop/SoNg/FF_project/data/20240520_Data_product"
+    folder_check = "./data/20240520_Data_product"
     
     for path in os.listdir(folder_check):
-
         image = cv2.imread(os.path.join(folder_check, path))
         print("image: ", image.shape, os.path.join(folder_check, path))
-        result = solar_search.search_image(image = image, top_k = 1)
+        result = solar_search.search_image(image=image, top_k=5)
