@@ -1,0 +1,6 @@
+*.pyc
+__pycache__
+logs
+*.mdb
+*.pt
+*.pth
